@@ -1,0 +1,167 @@
+// ftp_list_tests.nv — directory listings: MLSD facts exactly, and the Unix
+// and DOS LIST formats as a best effort.
+//
+// THE MLSD LINES are in the form RFC 3659 section 7.7 prints, with the
+// fact names in the case the RFC uses.  The LIST lines are the ones `ls -l`
+// on Linux and the IIS FTP server write, with a file name that has spaces
+// in it, a link and a name without a group.
+
+use std.bytes
+use std.test
+use ftplist
+
+fn b(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+fn facts_error(line: Str) -> Str
+    match ftplist.parse_facts(line)
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn facts_of(line: Str) -> FtpEntry
+    match ftplist.parse_facts(line)
+        Ok(e)  => e
+        Err(e) => core.panic.panic(e.message())
+
+fn unix_of(line: Str) -> FtpEntry
+    match ftplist.parse_unix(line)
+        Ok(e)  => e
+        Err(e) => core.panic.panic(e.message())
+
+fn dos_of(line: Str) -> FtpEntry
+    match ftplist.parse_dos(line)
+        Ok(e)  => e
+        Err(e) => core.panic.panic(e.message())
+
+@test
+fn test_mlsd_facts_of_rfc_3659_section_7() [io]
+    test.case("a file")
+    let f = facts_of("type=file;size=1024;modify=20240229123045;perm=r; my file.txt")
+    test.assert_eq(f.name, "my file.txt")
+    test.assert_eq(f.kind, "file")
+    test.assert_eq(f.size, 1024)
+    test.assert_eq(f.modify, "20240229123045")
+    test.assert_eq(f.perm, "r")
+    test.assert_eq(list.len(f.facts), 4)
+
+    // RFC 3659 section 7.7: the current directory of an MLSD answer.
+    test.case("fact names in any case, the directory itself")
+    let d = facts_of("Type=cdir;Modify=19981107085215;Perm=el; /tmp")
+    test.assert_eq(d.kind, "cdir")
+    test.assert_eq(d.name, "/tmp")
+    test.assert_eq(d.size, -1)
+    test.assert_eq(d.facts[0], "type=cdir")
+    test.assert_eq(d.modify, "19981107085215")
+
+    test.case("a symbolic link and its target")
+    let l = facts_of("type=OS.unix=slink:/etc/passwd;size=11; passwd-link")
+    test.assert_eq(l.kind, "link")
+    test.assert_eq(l.target, "/etc/passwd")
+    let m = facts_of("type=OS.unix=slink; bare")
+    test.assert_eq(m.kind, "link")
+    test.assert_eq(m.target, "")
+
+    test.case("no facts, and a fact with no value")
+    let n = facts_of(" just-a-name")
+    test.assert_eq(n.name, "just-a-name")
+    test.assert_eq(n.kind, "")
+    let o = facts_of("readonly;type=dir; x")
+    test.assert_eq(o.facts[0], "readonly=")
+    test.assert_eq(o.kind, "dir")
+
+    test.case("lines with no name")
+    test.assert_eq(facts_error("type=file;size=3;"), "\"type=file;size=3;\" is not a list of facts and a name")
+    test.assert_eq(facts_error("type=file; "), "\"type=file; \" is not a list of facts and a name")
+
+@test
+fn test_unix_listing_lines() [io]
+    test.case("a file with a time")
+    let a = unix_of("-rw-r--r--   1 owner group     1234 Jan 12 10:30 file name.txt")
+    test.assert_eq(a.name, "file name.txt")
+    test.assert_eq(a.kind, "file")
+    test.assert_eq(a.size, 1234)
+    test.assert_eq(a.modify, "Jan 12 10:30")
+    test.assert_eq(a.perm, "-rw-r--r--")
+
+    test.case("a directory with a year")
+    let d = unix_of("drwxr-xr-x   2 ftp ftp 4096 Jan  1  2020 pub")
+    test.assert_eq(d.kind, "dir")
+    test.assert_eq(d.name, "pub")
+    test.assert_eq(d.modify, "Jan 1 2020")
+
+    test.case("a link and its target")
+    let l = unix_of("lrwxrwxrwx 1 root root 7 Mar  3 12:00 current -> releases/1.2")
+    test.assert_eq(l.kind, "link")
+    test.assert_eq(l.name, "current")
+    test.assert_eq(l.target, "releases/1.2")
+
+    test.case("a link with no arrow keeps its whole name")
+    let k = unix_of("lrwxrwxrwx 1 root root 7 Mar  3 12:00 dangling")
+    test.assert_eq(k.name, "dangling")
+    test.assert_eq(k.target, "")
+
+    test.case("no group column, and a mode with a trailing +")
+    let g = unix_of("-rw-r--r--+ 1 owner 99 Dec 31 23:59 a")
+    test.assert_eq(g.size, 99)
+    test.assert_eq(g.name, "a")
+    test.assert_eq(g.perm, "-rw-r--r--+")
+
+    test.case("a device is other")
+    test.assert_eq(unix_of("crw-rw-rw- 1 root root 1 Jan 1 00:00 null").kind, "other")
+
+    test.case("lines that are not entries")
+    for bad in ["garbage", "", "-rw-r--r-- 1 u g 5 Foo 12 10:30 x", "-rw-r--r-- 1 u g 5 Jan 12 10:30",
+                "xrw-r--r-- 1 u g 5 Jan 12 10:30 x", "-rw 1 u g 5 Jan 12 10:30 x", "-rw-r--r-- 1 u g x Jan 12 10:30 y",
+                "-rw-r--r-- 1 u g 5 Jan 12 10:3 y", "-rw-r--r-- 1 u g 5 Jan 12 1x:30 y", "-rw-r--r-- 1 u g 5 Jan 12 10:3x y"]
+        match ftplist.parse_unix(bad)
+            Ok(_)  => test.assert_eq(bad, "refused")
+            Err(e) => test.assert_eq(e.message(), "\"" + bad + "\" is in neither the Unix nor the DOS listing format")
+
+@test
+fn test_dos_listing_lines() [io]
+    test.case("a directory")
+    let d = dos_of("11-02-23  09:15AM       <DIR>          wwwroot")
+    test.assert_eq(d.kind, "dir")
+    test.assert_eq(d.size, -1)
+    test.assert_eq(d.name, "wwwroot")
+    test.assert_eq(d.modify, "11-02-23 09:15AM")
+
+    test.case("a file whose name has spaces, a four-digit year and 24-hour time")
+    let f = dos_of("02-29-2024  13:30             1234 my file.txt")
+    test.assert_eq(f.kind, "file")
+    test.assert_eq(f.size, 1234)
+    test.assert_eq(f.name, "my file.txt")
+
+    test.case("lines that are not entries")
+    for bad in ["", "11-02-23 09:15AM", "11-2-23  09:15AM  5 x", "11-02-3  09:15AM  5 x", "xx-02-23  09:15AM  5 x",
+                "11-02-23  9:15AM  5 x", "11-02-23  09:15XM  5 x", "11-02-23  09:15AM  big x", "11-02-23  09x15AM  5 x",
+                "11-02-23  ab:15AM  5 x", "11-02-23  09:cdAM  5 x", "11-xx-23  09:15AM  5 x", "11-02-xx  09:15AM  5 x"]
+        match ftplist.parse_dos(bad)
+            Ok(_)  => test.assert_eq(bad, "refused")
+            Err(e) => test.assert_eq(e.message(), "\"" + bad + "\" is in neither the Unix nor the DOS listing format")
+
+@test
+fn test_a_whole_listing() [io]
+    test.case("Unix lines, with a total line, a blank line and some junk")
+    let unix = b("total 12\r\ndrwxr-xr-x 2 u g 4096 Jan  1 10:00 .\r\n-rw-r--r-- 1 u g 12 Jan 12 10:30 a.txt\r\n\r\nnot a listing\r\n")
+    let l = ftplist.parse_listing(unix)
+    test.assert_eq(list.len(l.entries), 2)
+    test.assert_eq(l.skipped, 1)
+    test.assert_eq(l.entries[1].name, "a.txt")
+
+    test.case("DOS lines, ended by a bare LF")
+    let dos = b("11-02-23  09:15AM       <DIR>          wwwroot\n02-29-24  12:30PM             1234 a b.txt\n")
+    let m = ftplist.parse_listing(dos)
+    test.assert_eq(list.len(m.entries), 2)
+    test.assert_eq(m.entries[1].size, 1234)
+    test.assert_eq(m.skipped, 0)
+
+    test.case("an empty transfer")
+    test.assert_eq(list.len(ftplist.parse_listing([]).entries), 0)
+
+    test.case("an MLSD transfer")
+    let mlsd = b("type=cdir;modify=19981107085215;perm=el; /tmp\r\ntype=file;size=3; a\r\n\r\nrubbish\r\n")
+    let n = ftplist.parse_mlsd(mlsd)
+    test.assert_eq(list.len(n.entries), 2)
+    test.assert_eq(n.skipped, 1)
+    test.assert_eq(n.entries[1].size, 3)

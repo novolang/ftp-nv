@@ -1,0 +1,449 @@
+// ftp_session_tests.nv — the control connection driven with bytes.
+//
+// THE DIALOGUES are built from the examples in RFC 959, RFC 2428,
+// RFC 2389, RFC 3659 and RFC 4217, with the server's replies in the texts
+// vsftpd 3.0 and ProFTPD 1.3 write for the same commands.  No test opens a
+// socket: the bytes the session writes are compared with the command
+// lines, and the bytes the server would send are handed to `feed`.
+
+use std.bytes
+use std.str
+use std.test
+use ftpsession
+
+fn b(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+fn txt(x: [u8]) -> Str
+    bytes.byte_list_to_str(x)
+
+// One event as a short word, so that a test states what it expects as
+// text.
+fn show(e: FtpEvent) -> Str
+    match e
+        FtpGreeting(t)           => "greeting(" + t + ")"
+        FtpLoggedIn(t)           => "logged-in(" + t + ")"
+        FtpPreliminary(c, n, t)  => "preliminary(" + c + "|" + str.from_int(n) + "|" + t + ")"
+        FtpIntermediate(c, n, t) => "intermediate(" + c + "|" + str.from_int(n) + "|" + t + ")"
+        FtpOk(c, n, t)           => "ok(" + c + "|" + str.from_int(n) + "|" + t + ")"
+        FtpPassive(h, p)         => "passive(" + h + ":" + str.from_int(p) + ")"
+        FtpWorkingDir(c, p)      => "dir(" + c + "|" + p + ")"
+        FtpSize(n)               => "size(" + str.from_int(n) + ")"
+        FtpModified(t)           => "modified(" + str.from_int(t.year) + "-" + str.from_int(t.month) + "-" + str.from_int(t.day) + ")"
+        FtpFeatures(fs)          => "features(" + str.join(fs, ",") + ")"
+        FtpFacts(en)             => "facts(" + en.name + "|" + en.kind + "|" + str.from_int(en.size) + ")"
+        FtpTlsReady              => "tls"
+        FtpBye(t)                => "bye(" + t + ")"
+        FtpRefused(c, n, t)      => "refused(" + c + "|" + str.from_int(n) + "|" + t + ")"
+        FtpFailed(err)           => "failed(" + err.message() + ")"
+
+fn shown(events: [FtpEvent]) -> Str
+    str.join(list.map(events, e => show(e)), " ")
+
+fn feed_text(var c: FtpClient, s: Str) -> Str
+    shown(ftpsession.feed(var c, b(s)))
+
+// A client that has read vsftpd's greeting.
+fn connected() -> FtpClient
+    var c = ftpsession.new_client()
+    let _g = ftpsession.feed(var c, b("220 (vsFTPd 3.0.3)\r\n"))
+    c
+
+// A client that has logged in.
+fn logged_in() -> FtpClient
+    var c = connected()
+    sent(var c, FtpCmdUser("anonymous"))
+    let _a = ftpsession.feed(var c, b("331 Please specify the password.\r\n"))
+    sent(var c, FtpCmdPass("guest"))
+    let _b = ftpsession.feed(var c, b("230 Login successful.\r\n"))
+    c
+
+// Send a command, failing the test if it is refused.
+fn sent(var c: FtpClient, cmd: FtpCommand)
+    match ftpsession.send(var c, cmd)
+        Ok(_)  => 0
+        Err(e) => test.assert_eq(e.message(), "")
+
+fn line_of(var c: FtpClient, cmd: FtpCommand) -> Str
+    match ftpsession.send(var c, cmd)
+        Ok(x)  => txt(x)
+        Err(e) => "error: " + e.message()
+
+// Send a command and feed the reply, answering the events.
+fn exchange(var c: FtpClient, cmd: FtpCommand, reply: Str) -> Str
+    sent(var c, cmd)
+    feed_text(var c, reply)
+
+@test
+fn test_the_greeting() [io]
+    test.case("a greeting")
+    var c = ftpsession.new_client()
+    test.assert_eq(ftpsession.phase_name(c.phase), "greeting")
+    test.assert_eq(feed_text(var c, "220 (vsFTPd 3.0.3)\r\n"), "greeting((vsFTPd 3.0.3))")
+    test.assert_eq(ftpsession.phase_name(c.phase), "connected")
+
+    test.case("a greeting of several lines; the lines between are kept as sent")
+    var d = ftpsession.new_client()
+    test.assert_eq(feed_text(var d, "220-Welcome\r\n220-Hello\r\n 220 not the end\r\n220 ProFTPD Server ready\r\n"),
+                   "greeting(Welcome\n220-Hello\n 220 not the end\nProFTPD Server ready)")
+
+    test.case("120 and then 220")
+    var e = ftpsession.new_client()
+    test.assert_eq(feed_text(var e, "120 Service ready in 2 minutes\r\n220 ready\r\n"),
+                   "preliminary(|120|Service ready in 2 minutes) greeting(ready)")
+
+    test.case("a greeting one byte at a time")
+    var f = ftpsession.new_client()
+    var seen: [Str] = []
+    for ch in b("220 hi\r\n")
+        let s = shown(ftpsession.feed(var f, [ch]))
+        if str.len(s) > 0
+            list.push(seen, s)
+    test.assert_eq(str.join(seen, "|"), "greeting(hi)")
+
+    test.case("a greeting ended by a bare LF")
+    var g = ftpsession.new_client()
+    test.assert_eq(feed_text(var g, "220 hi\n"), "greeting(hi)")
+
+    test.case("421 as the greeting ends the session")
+    var h = ftpsession.new_client()
+    test.assert_eq(feed_text(var h, "421 Too many users\r\n"), "refused(|421|Too many users)")
+    test.assert_eq(ftpsession.phase_name(h.phase), "ended")
+
+    test.case("another code as the greeting is a fault")
+    var i = ftpsession.new_client()
+    test.assert_eq(feed_text(var i, "530 Access denied\r\n"), "failed(the first reply is 530 and not 220)")
+
+    test.case("a line that is not a reply")
+    var j = ftpsession.new_client()
+    test.assert_eq(feed_text(var j, "SSH-2.0-OpenSSH_9.6\r\n"),
+                   "failed(the line \"SSH-2.0-OpenSSH_9.6\" is not an FTP reply)")
+
+@test
+fn test_login() [io]
+    test.case("USER and PASS")
+    var c = connected()
+    test.assert_eq(line_of(var c, FtpCmdUser("anonymous")), "USER anonymous\r\n")
+    test.assert_eq(feed_text(var c, "331 Please specify the password.\r\n"),
+                   "intermediate(USER|331|Please specify the password.)")
+    test.assert_eq(line_of(var c, FtpCmdPass("guest@")), "PASS guest@\r\n")
+    test.assert_eq(feed_text(var c, "230 Login successful.\r\n"), "logged-in(Login successful.)")
+    test.assert_eq(ftpsession.phase_name(c.phase), "logged in")
+
+    test.case("a refused password")
+    var d = connected()
+    let _a = exchange(var d, FtpCmdUser("u"), "331 Password required for u\r\n")
+    test.assert_eq(exchange(var d, FtpCmdPass("wrong"), "530 Login incorrect.\r\n"),
+                   "refused(PASS|530|Login incorrect.)")
+    test.assert_eq(ftpsession.phase_name(d.phase), "connected")
+
+    test.case("a server that wants an account")
+    var e = connected()
+    let _b = exchange(var e, FtpCmdUser("u"), "331 more\r\n")
+    test.assert_eq(exchange(var e, FtpCmdPass("p"), "332 Need account for login.\r\n"),
+                   "intermediate(PASS|332|Need account for login.)")
+    test.assert_eq(exchange(var e, FtpCmdAcct("proj"), "230 ok\r\n"), "logged-in(ok)")
+
+    test.case("a USER that logs in at once")
+    var f = connected()
+    test.assert_eq(exchange(var f, FtpCmdUser("anonymous"), "230 Anonymous access granted\r\n"),
+                   "logged-in(Anonymous access granted)")
+
+@test
+fn test_commands_in_the_wrong_place() [io]
+    test.case("nothing before the greeting")
+    var c = ftpsession.new_client()
+    test.assert_eq(line_of(var c, FtpCmdUser("x")), "error: USER is not allowed in the greeting state")
+
+    test.case("the commands of a session need a login")
+    var d = connected()
+    test.assert_eq(line_of(var d, FtpCmdPwd), "error: PWD is not allowed in the connected state")
+    test.assert_eq(line_of(var d, FtpCmdRetr("a")), "error: RETR is not allowed in the connected state")
+    test.assert_eq(line_of(var d, FtpCmdNoop), "NOOP\r\n")
+
+    test.case("a second command while one is unanswered")
+    test.assert_eq(line_of(var d, FtpCmdQuit), "error: QUIT cannot be sent while the last command is unanswered")
+
+    test.case("arguments are checked and a refused command leaves the session free")
+    var e = logged_in()
+    test.assert_eq(line_of(var e, FtpCmdRetr("")),
+        "error: the argument of RETR is empty or holds a CR, an LF, a NUL or 0xFF")
+    test.assert_eq(line_of(var e, FtpCmdCwd("a\r\nDELE x")),
+        "error: the argument of CWD is empty or holds a CR, an LF, a NUL or 0xFF")
+    test.assert_eq(line_of(var e, FtpCmdRest(-1)), "error: -1 is not a valid offset, port or protocol number")
+    test.assert_eq(line_of(var e, FtpCmdPbsz(-1)), "error: -1 is not a valid offset, port or protocol number")
+    test.assert_eq(line_of(var e, FtpCmdPort("1.2.3", 5)), "error: \"1.2.3\" is not a usable host address")
+    test.assert_eq(line_of(var e, FtpCmdEprt(1, "1.2.3.4", 0)),
+        "error: 0 is not a valid offset, port or protocol number")
+    test.assert_eq(line_of(var e, FtpCmdOpts("", "ON")),
+        "error: the argument of OPTS is empty or holds a CR, an LF, a NUL or 0xFF")
+    test.assert_eq(line_of(var e, FtpCmdNoop), "NOOP\r\n")
+
+@test
+fn test_directories() [io]
+    var c = logged_in()
+    test.case("PWD")
+    test.assert_eq(exchange(var c, FtpCmdPwd, "257 \"/home/user\" is the current directory\r\n"),
+        "dir(PWD|/home/user)")
+    test.case("MKD, with a quote in the name")
+    test.assert_eq(line_of(var c, FtpCmdMkd("a \"b\"")), "MKD a \"b\"\r\n")
+    test.assert_eq(feed_text(var c, "257 \"/home/user/a \"\"b\"\"\" directory created\r\n"),
+        "dir(MKD|/home/user/a \"b\")")
+    test.case("a server that answers MKD with 250 gets the generic event")
+    test.assert_eq(exchange(var c, FtpCmdMkd("plain"), "250 created\r\n"), "ok(MKD|250|created)")
+    test.case("CWD, CDUP, RMD and DELE")
+    test.assert_eq(exchange(var c, FtpCmdCwd("pub"), "250 Directory successfully changed.\r\n"),
+                   "ok(CWD|250|Directory successfully changed.)")
+    test.assert_eq(exchange(var c, FtpCmdCdup, "250 Directory successfully changed.\r\n"),
+                   "ok(CDUP|250|Directory successfully changed.)")
+    test.assert_eq(exchange(var c, FtpCmdRmd("old"), "250 Remove directory operation successful.\r\n"),
+                   "ok(RMD|250|Remove directory operation successful.)")
+    test.assert_eq(exchange(var c, FtpCmdDele("x"), "550 Delete operation failed.\r\n"),
+                   "refused(DELE|550|Delete operation failed.)")
+    test.case("a rename takes two commands")
+    test.assert_eq(exchange(var c, FtpCmdRnfr("a.txt"), "350 Ready for RNTO.\r\n"),
+        "intermediate(RNFR|350|Ready for RNTO.)")
+    test.assert_eq(exchange(var c, FtpCmdRnto("b.txt"), "250 Rename successful.\r\n"),
+        "ok(RNTO|250|Rename successful.)")
+    test.case("a 257 reply that has no quoted path ends the session")
+    test.assert_eq(exchange(var c, FtpCmdPwd, "257 /home\r\n"),
+        "failed(\"/home\" does not begin with a quoted path)")
+
+@test
+fn test_transfer_parameters() [io]
+    var c = logged_in()
+    test.case("TYPE, MODE and STRU")
+    test.assert_eq(line_of(var c, FtpCmdType("I")), "TYPE I\r\n")
+    test.assert_eq(feed_text(var c, "200 Switching to Binary mode.\r\n"),
+        "ok(TYPE|200|Switching to Binary mode.)")
+    test.assert_eq(exchange(var c, FtpCmdMode("S"), "200 Mode set to S.\r\n"), "ok(MODE|200|Mode set to S.)")
+    test.assert_eq(exchange(var c, FtpCmdStru("F"), "200 Structure set to F.\r\n"),
+        "ok(STRU|200|Structure set to F.)")
+
+    test.case("PASV")
+    test.assert_eq(line_of(var c, FtpCmdPasv), "PASV\r\n")
+    test.assert_eq(feed_text(var c, "227 Entering Passive Mode (127,0,0,1,193,115).\r\n"),
+        "passive(127.0.0.1:49523)")
+
+    // RFC 2428 section 3.
+    test.case("EPSV, bare and with an argument")
+    test.assert_eq(line_of(var c, FtpCmdEpsv("")), "EPSV\r\n")
+    test.assert_eq(feed_text(var c, "229 Entering Extended Passive Mode (|||6446|)\r\n"), "passive(:6446)")
+    test.assert_eq(line_of(var c, FtpCmdEpsv("ALL")), "EPSV ALL\r\n")
+    test.assert_eq(feed_text(var c, "200 EPSV ALL ok\r\n"), "ok(EPSV|200|EPSV ALL ok)")
+
+    // RFC 2428 section 2.
+    test.case("PORT and EPRT")
+    test.assert_eq(exchange(var c, FtpCmdPort("192.168.0.1", 5001), "200 PORT command successful.\r\n"),
+                   "ok(PORT|200|PORT command successful.)")
+    test.assert_eq(line_of(var c, FtpCmdEprt(2, "1080::8:800:200C:417A", 5282)),
+        "EPRT |2|1080::8:800:200C:417A|5282|\r\n")
+    test.assert_eq(feed_text(var c, "200 EPRT command successful.\r\n"), "ok(EPRT|200|EPRT command successful.)")
+
+    test.case("a 227 reply with no address, and a 229 reply with no port")
+    var d = logged_in()
+    test.assert_eq(exchange(var d, FtpCmdPasv, "227 Entering Passive Mode.\r\n"),
+                   "failed(\"Entering Passive Mode.\" holds no host and port for passive mode)")
+    var e = logged_in()
+    test.assert_eq(exchange(var e, FtpCmdEpsv(""), "229 Entering Extended Passive Mode.\r\n"),
+                   "failed(\"Entering Extended Passive Mode.\" is not an extended passive port)")
+
+@test
+fn test_transfers() [io]
+    var c = logged_in()
+    test.case("RETR: the preliminary reply and the final one in two reads")
+    test.assert_eq(line_of(var c, FtpCmdRetr("a b.txt")), "RETR a b.txt\r\n")
+    test.assert_eq(feed_text(var c, "150 Opening BINARY mode data connection for a b.txt (12 bytes).\r\n"),
+                   "preliminary(RETR|150|Opening BINARY mode data connection for a b.txt (12 bytes).)")
+    test.assert_eq(line_of(var c, FtpCmdNoop), "error: NOOP cannot be sent while the last command is unanswered")
+    test.assert_eq(feed_text(var c, "226 Transfer complete.\r\n"), "ok(RETR|226|Transfer complete.)")
+
+    test.case("STOR: both replies in one read")
+    test.assert_eq(exchange(var c, FtpCmdStor("up.bin"), "150 Ok to send data.\r\n226 Transfer complete.\r\n"),
+                   "preliminary(STOR|150|Ok to send data.) ok(STOR|226|Transfer complete.)")
+
+    test.case("APPE and a refused RETR")
+    test.assert_eq(exchange(var c, FtpCmdAppe("log"), "125 Data connection already open; transfer starting.\r\n226 ok\r\n"),
+                   "preliminary(APPE|125|Data connection already open; transfer starting.) ok(APPE|226|ok)")
+    test.assert_eq(exchange(var c, FtpCmdRetr("nope"), "550 Failed to open file.\r\n"),
+        "refused(RETR|550|Failed to open file.)")
+
+    test.case("REST then RETR resumes (RFC 3659 section 5)")
+    test.assert_eq(line_of(var c, FtpCmdRest(1000)), "REST 1000\r\n")
+    test.assert_eq(feed_text(var c, "350 Restart position accepted (1000).\r\n"),
+                   "intermediate(REST|350|Restart position accepted (1000).)")
+    test.assert_eq(exchange(var c, FtpCmdRetr("big"), "150 Opening\r\n226 Done\r\n"),
+                   "preliminary(RETR|150|Opening) ok(RETR|226|Done)")
+
+    test.case("LIST, NLST and MLSD, with and without a path")
+    test.assert_eq(line_of(var c, FtpCmdList("")), "LIST\r\n")
+    test.assert_eq(feed_text(var c, "150 Here comes the directory listing.\r\n226 Directory send OK.\r\n"),
+                   "preliminary(LIST|150|Here comes the directory listing.) ok(LIST|226|Directory send OK.)")
+    test.assert_eq(line_of(var c, FtpCmdNlst("pub")), "NLST pub\r\n")
+    test.assert_eq(feed_text(var c, "226 ok\r\n"), "ok(NLST|226|ok)")
+    test.assert_eq(line_of(var c, FtpCmdMlsd("")), "MLSD\r\n")
+    test.assert_eq(feed_text(var c, "226 ok\r\n"), "ok(MLSD|226|ok)")
+    test.assert_eq(line_of(var c, FtpCmdMlst("x")), "MLST x\r\n")
+
+@test
+fn test_size_and_modification_time() [io]
+    var c = logged_in()
+    test.assert_eq(exchange(var c, FtpCmdSize("a.bin"), "213 1048576\r\n"), "size(1048576)")
+    test.assert_eq(exchange(var c, FtpCmdSize("nope"), "550 Could not get file size.\r\n"),
+                   "refused(SIZE|550|Could not get file size.)")
+    // RFC 3659 section 3.3.
+    test.assert_eq(exchange(var c, FtpCmdMdtm("cap60.pl"), "213 19980615100045.014\r\n"), "modified(1998-6-15)")
+    test.case("replies with no size and no time end the session")
+    var d = logged_in()
+    test.assert_eq(exchange(var d, FtpCmdSize("a"), "213 big\r\n"), "failed(\"big\" is not a size)")
+    var e = logged_in()
+    test.assert_eq(exchange(var e, FtpCmdMdtm("a"), "213 yesterday\r\n"),
+        "failed(\"yesterday\" is not a modification time)")
+
+@test
+fn test_features_of_rfc_2389() [io]
+    var c = connected()
+    test.assert_eq(line_of(var c, FtpCmdFeat), "FEAT\r\n")
+    test.assert_eq(feed_text(var c,
+        "211-Features:\r\n EPRT\r\n EPSV\r\n MDTM\r\n PASV\r\n REST STREAM\r\n SIZE\r\n TVFS\r\n UTF8\r\n211 End\r\n"),
+                   "features(EPRT,EPSV,MDTM,PASV,REST STREAM,SIZE,TVFS,UTF8)")
+    test.assert_eq(list.len(ftpsession.features(c)), 8)
+
+    test.case("OPTS with and without options")
+    test.assert_eq(line_of(var c, FtpCmdOpts("UTF8", "ON")), "OPTS UTF8 ON\r\n")
+    test.assert_eq(feed_text(var c, "200 Always in UTF8 mode.\r\n"), "ok(OPTS|200|Always in UTF8 mode.)")
+    test.assert_eq(line_of(var c, FtpCmdOpts("MLST", "")), "OPTS MLST\r\n")
+    test.assert_eq(feed_text(var c, "501 bad\r\n"), "refused(OPTS|501|bad)")
+
+    test.case("a server that has no features")
+    var d = connected()
+    test.assert_eq(exchange(var d, FtpCmdFeat, "211 no features\r\n"), "features()")
+
+    test.case("SYST and a refused FEAT")
+    var e = connected()
+    test.assert_eq(exchange(var e, FtpCmdSyst, "215 UNIX Type: L8\r\n"), "ok(SYST|215|UNIX Type: L8)")
+    test.assert_eq(exchange(var e, FtpCmdFeat, "500 Unknown command.\r\n"), "refused(FEAT|500|Unknown command.)")
+
+@test
+fn test_mlst_of_rfc_3659() [io]
+    var c = logged_in()
+    // RFC 3659 section 7.7: the entry is the line after the first, with
+    // the space that marks a continuation.
+    test.assert_eq(exchange(var c,
+        FtpCmdMlst("tmp"),
+        "250- Listing tmp\r\n Type=cdir;Modify=19981107085215;Perm=el; /tmp\r\n250 End\r\n"),
+                   "facts(/tmp|cdir|-1)")
+    test.case("an entry whose line has no leading space")
+    test.assert_eq(exchange(var c, FtpCmdMlst("x"), "250-Listing x\r\ntype=file;size=9; x\r\n250 End\r\n"),
+                   "facts(x|file|9)")
+    test.case("a reply too short to hold an entry")
+    var d = logged_in()
+    test.assert_eq(exchange(var d, FtpCmdMlst("x"), "250 done\r\n"),
+        "failed(\"done\" is not a list of facts and a name)")
+
+@test
+fn test_tls_of_rfc_4217() [io]
+    var c = connected()
+    let _f = exchange(var c, FtpCmdFeat, "211-Features:\r\n AUTH TLS\r\n PBSZ\r\n PROT\r\n211 End\r\n")
+    test.assert_eq(line_of(var c, FtpCmdAuth("TLS")), "AUTH TLS\r\n")
+    test.assert_eq(feed_text(var c, "234 Proceed with negotiation.\r\n"), "tls")
+    ftpsession.tls_started(var c)
+    test.assert_eq(list.len(ftpsession.features(c)), 0)
+    test.assert_eq(ftpsession.phase_name(c.phase), "connected")
+
+    test.case("PBSZ and PROT")
+    test.assert_eq(line_of(var c, FtpCmdPbsz(0)), "PBSZ 0\r\n")
+    test.assert_eq(feed_text(var c, "200 PBSZ=0\r\n"), "ok(PBSZ|200|PBSZ=0)")
+    test.assert_eq(line_of(var c, FtpCmdProt("P")), "PROT P\r\n")
+    test.assert_eq(feed_text(var c, "200 PROT now Private.\r\n"), "ok(PROT|200|PROT now Private.)")
+
+    test.case("a server without TLS")
+    var d = connected()
+    test.assert_eq(exchange(var d, FtpCmdAuth("TLS"), "504 Unknown AUTH type.\r\n"),
+        "refused(AUTH|504|Unknown AUTH type.)")
+
+@test
+fn test_quit_and_421() [io]
+    test.case("QUIT")
+    var c = logged_in()
+    test.assert_eq(line_of(var c, FtpCmdQuit), "QUIT\r\n")
+    test.assert_eq(feed_text(var c, "221 Goodbye.\r\n"), "bye(Goodbye.)")
+    test.assert_eq(ftpsession.phase_name(c.phase), "ended")
+    test.assert_eq(line_of(var c, FtpCmdNoop), "error: NOOP is not allowed in the ended state")
+    test.assert_eq(feed_text(var c, "200 x\r\n"), "failed(the session has ended)")
+
+    test.case("QUIT before a login")
+    var q = connected()
+    test.assert_eq(exchange(var q, FtpCmdQuit, "221 Goodbye.\r\n"), "bye(Goodbye.)")
+
+    // RFC 959 section 4.2: 421 is the server closing the connection.
+    test.case("421 in answer to a command")
+    var d = logged_in()
+    test.assert_eq(exchange(var d, FtpCmdNoop, "421 Timeout.\r\n"), "refused(NOOP|421|Timeout.)")
+    test.assert_eq(ftpsession.phase_name(d.phase), "ended")
+
+    test.case("421 when no command is waiting")
+    var e = logged_in()
+    test.assert_eq(feed_text(var e, "421 Timeout.\r\n"), "refused(|421|Timeout.)")
+    test.assert_eq(ftpsession.phase_name(e.phase), "ended")
+
+@test
+fn test_multi_line_replies() [io]
+    var c = logged_in()
+    test.case("lines between the first and the last may begin with digits")
+    test.assert_eq(exchange(var c, FtpCmdNoop, "200-first\r\n999 odd line\r\n200-still going\r\n200 done\r\n"),
+                   "ok(NOOP|200|first\n999 odd line\n200-still going\ndone)")
+    test.case("the last line may be the bare code")
+    test.assert_eq(exchange(var c, FtpCmdNoop, "200-x\r\n200\r\n"), "ok(NOOP|200|x\n)")
+    test.case("a reply in pieces")
+    sent(var c, FtpCmdNoop)
+    let a = feed_text(var c, "200-par")
+    let b2 = feed_text(var c, "t\r\n200 end\r")
+    let c2 = feed_text(var c, "\n")
+    test.assert_eq(a + "|" + b2 + "|" + c2, "||ok(NOOP|200|part\nend)")
+
+@test
+fn test_a_server_that_sends_what_ftp_does_not() [io]
+    test.case("a reply when no command was sent")
+    var c = logged_in()
+    test.assert_eq(feed_text(var c, "200 surprise\r\n"),
+        "failed(the reply 200 \"surprise\" arrived and no command was waiting)")
+    test.case("a preliminary reply when no command was sent")
+    var d = logged_in()
+    test.assert_eq(feed_text(var d, "150 surprise\r\n"),
+        "failed(the reply 150 \"surprise\" arrived and no command was waiting)")
+    test.case("a line that is not a reply")
+    var e = logged_in()
+    sent(var e, FtpCmdNoop)
+    test.assert_eq(feed_text(var e, "hello\r\n"), "failed(the line \"hello\" is not an FTP reply)")
+    test.assert_eq(feed_text(var e, "200 x\r\n"), "failed(the session has ended)")
+
+@test
+fn test_limits() [io]
+    test.case("a line over 4096 octets that ends")
+    var c = logged_in()
+    sent(var c, FtpCmdNoop)
+    test.assert_eq(feed_text(var c, "200 " + str.repeat("x", 4100) + "\r\n"),
+        "failed(a reply is longer than the limit of 4096 octets)")
+
+    test.case("a line that never ends")
+    var d = logged_in()
+    sent(var d, FtpCmdNoop)
+    test.assert_eq(feed_text(var d, "200 " + str.repeat("x", 4100)),
+        "failed(a reply is longer than the limit of 4096 octets)")
+
+    test.case("a line of 4096 octets is read")
+    var e = logged_in()
+    sent(var e, FtpCmdNoop)
+    test.assert_eq(str.len(feed_text(var e, "200 " + str.repeat("x", 4092) + "\r\n")), 4105)
+
+    test.case("a multi-line reply over 65536 octets")
+    var f = logged_in()
+    sent(var f, FtpCmdNoop)
+    let _a = feed_text(var f, "200-start\r\n")
+    var last = ""
+    for _i in 0..20
+        let shown_now = feed_text(var f, " " + str.repeat("y", 4000) + "\r\n")
+        if str.len(last) == 0
+            last = shown_now
+    test.assert_eq(last, "failed(a reply is longer than the limit of 65536 octets)")

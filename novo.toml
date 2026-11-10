@@ -1,0 +1,22 @@
+[package]
+name        = "ftp-nv"
+version     = "0.1.0"
+description = "FTP (RFC 959) as a codec and a control-connection session with no socket: the commands and the reply codes with multi-line replies, passive and extended passive data connections (RFC 2428), MDTM, SIZE, REST, MLST and MLSD facts (RFC 3659), FEAT and OPTS (RFC 2389), AUTH TLS as a command the caller follows with its own TLS (RFC 4217), and parsers for the Unix and DOS LIST formats. The data connection is the caller's stream."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "host"
+category    = "networking"
+tags        = ["ftp", "rfc959", "rfc2428", "rfc3659", "rfc2389", "rfc4217", "mlsd", "file-transfer", "sans-io", "state-machine"]
+repository  = "https://github.com/novolang/ftp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Talking to an FTP server, without a socket"
+
+[dependencies]
+# None.  A reply is text, a command is text and a listing is lines; the
+# standard library holds all that is needed.

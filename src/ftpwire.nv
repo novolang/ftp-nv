@@ -1,0 +1,420 @@
+// ftpwire.nv — the lines of FTP's control connection as values and as bytes.
+//
+// THE FORMATS.  Every line ends in CRLF.  A command is a keyword of three
+// or four letters and, for most, one argument after a single space
+// (RFC 959 section 5.3).  A reply is a three-digit code and text
+// (section 4.2).  A reply of several lines begins `123-text`, and ends at
+// the first line that begins `123 ` with the same code; the lines between
+// are free text and may begin with digits.
+//
+// The first digit of a reply code is its class: 1 is preliminary, 2 is
+// completed, 3 needs another command, 4 is a refusal that may succeed if
+// tried again and 5 is a refusal that will not (section 4.1.1).
+//
+// This module reads one line at a time and builds one command at a time,
+// and reads the texts of the replies that carry data: 227, 229, 257, 211,
+// and the answers to SIZE and MDTM.  The session in `ftpsession` decides
+// which line comes next.
+
+use std.bytes
+use std.str
+use ftperr
+
+// The well-known port of the control connection: 21.
+pub const FTP_PORT = 21
+// The longest command line, in octets with its CRLF: 4096.
+pub const FTP_COMMAND_MAX = 4096
+
+// One line of a reply, split into its parts.
+pub struct FtpReplyLine
+    // The three-digit code, 100 to 599.
+    code: Int
+    // False when the line is `123-text`, the start or the middle of a
+    // multi-line reply that has not ended.
+    last: Bool
+    // The text after the code and the separator.
+    text: Str
+
+// A host and a port for the data connection.
+pub struct FtpAddress
+    // Four decimal numbers separated by dots, or "" when the reply
+    // names only a port and the host is the one the control connection
+    // went to.
+    host: Str
+    // The port, 1 to 65535.
+    port: Int
+
+// A modification time as RFC 3659 section 2.3 writes it, in UTC.
+pub struct FtpTimestamp
+    // Four digits.
+    year: Int
+    // 1 to 12.
+    month: Int
+    // 1 to 31.
+    day: Int
+    // 0 to 23.
+    hour: Int
+    // 0 to 59.
+    minute: Int
+    // 0 to 60.
+    second: Int
+    // The digits after the dot, or "".
+    fraction: Str
+
+// The value of `s` when it is one to fifteen ASCII digits, and -1
+// otherwise.  A sign, a space or a sixteenth digit is refused.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     println("${ftpwire.parse_number("1024")} ${ftpwire.parse_number("-1")}")   // 1024 -1
+// ```
+pub fn parse_number(s: Str) -> Int
+    let n = str.len(s)
+    if n < 1 or n > 15
+        return -1
+    var v = 0
+    for i in 0..n
+        let b = str.byte_at_or(s, i, 0)
+        if b < 48 or b > 57
+            return -1
+        v = v * 10 + (b - 48)
+    v
+
+// Read one line of a reply, with its CRLF already removed.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_reply_line("220-Welcome")
+//         Ok(r)  => println("${r.code} ${r.last} ${r.text}")   // 220 false Welcome
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_reply_line(line: Str) -> Result<FtpReplyLine, FtpError>
+    let n = str.len(line)
+    let code = parse_number(str.slice(line, 0, (if n < 3 then n else 3)))
+    if n < 3 or code < 100 or code > 599
+        return Err(FtpBadReply(line))
+    if n == 3
+        return Ok(FtpReplyLine { code: code, last: true, text: "" })
+    let sep = str.byte_at_or(line, 3, 0)
+    if sep == 32
+        return Ok(FtpReplyLine { code: code, last: true, text: str.slice(line, 4, n) })
+    if sep == 45
+        return Ok(FtpReplyLine { code: code, last: false, text: str.slice(line, 4, n) })
+    Err(FtpBadReply(line))
+
+// Whether `line` ends the multi-line reply that began with `code`: it
+// begins with the same three digits and then a space, or is just those
+// digits (RFC 959 section 4.2).
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     println("${ftpwire.ends_reply(211, "211 End")} ${ftpwire.ends_reply(211, "211-End")}")   // true false
+// ```
+pub fn ends_reply(code: Int, line: Str) -> Bool
+    let head = str.from_int(code)
+    if line == head
+        return true
+    str.starts_with(line, head + " ")
+
+// The class of a reply code: its first digit.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     println("${ftpwire.reply_class(550)}")   // 5
+// ```
+pub fn reply_class(code: Int) -> Int
+    code / 100
+
+// Whether an argument may be sent: without a CR, an LF, a NUL or the
+// byte 0xFF, which Telnet would need doubled.
+fn argument_ok(arg: Str) -> Bool
+    not str.contains(arg, "\r") and not str.contains(arg, "\n")
+        and not str.contains(arg, str.from_byte(0)) and not str.contains(arg, str.from_byte(255))
+
+// Build one command line: the keyword, a space and the argument when
+// there is one, and a CRLF.
+//
+// An empty `arg` means the command has none.  Answers `FtpBadArgument`
+// for an argument with a CR, an LF, a NUL or 0xFF, and
+// `FtpCommandTooLong` when the line with its CRLF is over 4096 octets.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.encode_command("RETR", "a b.txt")
+//         Ok(b)  => println("${list.len(b)}")   // 14
+//         Err(e) => println(e.message())
+// ```
+pub fn encode_command(verb: Str, arg: Str) -> Result<[u8], FtpError>
+    if not argument_ok(arg)
+        return Err(FtpBadArgument(verb))
+    let text = if str.len(arg) == 0
+        verb
+    else
+        verb + " " + arg
+    let n = str.len(text) + 2
+    if n > FTP_COMMAND_MAX
+        return Err(FtpCommandTooLong(n))
+    Ok(bytes.to_byte_list(bytes.from_str(text + "\r\n")))
+
+// The six numbers of a PORT argument or a 227 text, from `h1,h2,h3,h4,p1,p2`.
+fn six_numbers(s: Str) -> [Int]
+    let parts = str.split(s, ",")
+    if list.len(parts) != 6
+        return []
+    let nums = list.map(parts, p => parse_number(str.trim(p)))
+    if list.any(nums, v => v < 0 or v > 255)
+        return []
+    nums
+
+// Read the host and port out of the text of a 227 reply
+// (RFC 959 section 4.1.2): six numbers, which are the host's four octets
+// and the port's two.
+//
+// The numbers are taken from inside the first pair of parentheses, as
+// the RFC writes them, or, when the text has none, from the first digit
+// to the end, which is how some servers write them. This is best effort.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_passive("Entering Passive Mode (192,168,0,1,19,137).")
+//         Ok(a)  => println("${a.host} ${a.port}")   // 192.168.0.1 5001
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_passive(text: Str) -> Result<FtpAddress, FtpError>
+    let nums = six_numbers(passive_digits(text))
+    if list.len(nums) != 6 or nums[4] * 256 + nums[5] < 1
+        return Err(FtpBadPassive(text))
+    let host = str.from_int(nums[0]) + "." + str.from_int(nums[1]) + "." + str.from_int(nums[2]) + "." + str.from_int(nums[3])
+    Ok(FtpAddress { host: host, port: nums[4] * 256 + nums[5] })
+
+// The part of a 227 text that holds the six numbers.
+fn passive_digits(text: Str) -> Str
+    match str.index(text, "(")
+        Some(lo) =>
+            match str.index_from(text, ")", lo + 1)
+                Some(hi) => str.slice(text, lo + 1, hi)
+                None     => str.slice(text, lo + 1, str.len(text))
+        None     =>
+            let at = first_digit(text)
+            str.trim(str.slice(text, at, str.len(text)))
+
+// The offset of the first ASCII digit in `s`, or its length.
+fn first_digit(s: Str) -> Int
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b >= 48 and b <= 57
+            return i
+    str.len(s)
+
+// Read the port out of the text of a 229 reply (RFC 2428 section 3):
+// `(|||6446|)`, where the delimiter may be any character from 33 to 126
+// other than a digit and the first three fields are empty.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_extended_passive("Entering Extended Passive Mode (|||6446|)")
+//         Ok(p)  => println("${p}")   // 6446
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_extended_passive(text: Str) -> Result<Int, FtpError>
+    let lo = str.index(text, "(") ?? -1
+    if lo < 0 or str.byte_at_or(text, lo + 1, 0) < 33
+        return Err(FtpBadExtendedPassive(text))
+    let delim = str.byte_str_at(text, lo + 1) ?? ""
+    let hi = str.index_from(text, ")", lo + 1) ?? -1
+    if hi < 0
+        return Err(FtpBadExtendedPassive(text))
+    let fields = str.split(str.slice(text, lo + 1, hi), delim)
+    let port = if list.len(fields) == 5
+        parse_number(fields[3])
+    else
+        -1
+    if list.len(fields) != 5 or str.len(fields[0]) + str.len(fields[1]) + str.len(fields[2]) + str.len(fields[4]) > 0
+        or port < 1 or port > 65535
+        return Err(FtpBadExtendedPassive(text))
+    Ok(port)
+
+// Check a data port: 1 to 65535.
+fn check_port(port: Int) -> Result<Int, FtpError>
+    if port < 1 or port > 65535
+        return Err(FtpBadNumber(port))
+    Ok(port)
+
+// The argument of a PORT command (RFC 959 section 4.1.2): the host's
+// four octets and the port's two, in decimal, separated by commas.
+// `host` is four decimal numbers separated by dots.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.port_argument("192.168.0.1", 5001)
+//         Ok(a)  => println(a)   // 192,168,0,1,19,137
+//         Err(e) => println(e.message())
+// ```
+pub fn port_argument(host: Str, port: Int) -> Result<Str, FtpError>
+    check_port(port)!
+    let nums = six_numbers(str.replace(host, ".", ",") + ",0,0")
+    if list.len(nums) != 6 or str.count(host, ".") != 3
+        return Err(FtpBadHost(host))
+    Ok(str.replace(host, ".", ",") + "," + str.from_int(port / 256) + "," + str.from_int(port % 256))
+
+// The argument of an EPRT command (RFC 2428 section 2): the protocol, 1
+// for IPv4 or 2 for IPv6, the address and the port, between `|`.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.eprt_argument(2, "::1", 5282)
+//         Ok(a)  => println(a)   // |2|::1|5282|
+//         Err(e) => println(e.message())
+// ```
+pub fn eprt_argument(protocol: Int, host: Str, port: Int) -> Result<Str, FtpError>
+    check_port(port)!
+    if protocol != 1 and protocol != 2
+        return Err(FtpBadNumber(protocol))
+    if str.len(host) == 0 or str.contains(host, "|") or not argument_ok(host)
+        return Err(FtpBadHost(host))
+    if protocol == 1 and list.len(six_numbers(str.replace(host, ".", ",") + ",0,0")) != 6
+        return Err(FtpBadHost(host))
+    Ok("|" + str.from_int(protocol) + "|" + host + "|" + str.from_int(port) + "|")
+
+// Read the path out of the text of a 257 reply (RFC 959 section 5, PWD
+// and MKD): the path is in double quotes, and a double quote inside it
+// is written twice.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_quoted_path("\"/srv/a \"\"b\"\"\" is the current directory")
+//         Ok(p)  => println(p)   // /srv/a "b"
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_quoted_path(text: Str) -> Result<Str, FtpError>
+    if str.byte_at_or(text, 0, 0) != 34
+        return Err(FtpBadPath(text))
+    var out = ""
+    var i = 1
+    while i < str.len(text)
+        let b = str.byte_at_or(text, i, 0)
+        if b == 34 and str.byte_at_or(text, i + 1, 0) == 34
+            out = out + "\""
+            i = i + 2
+        elif b == 34
+            return Ok(out)
+        else
+            out = out + str.from_byte(b)
+            i = i + 1
+    Err(FtpBadPath(text))
+
+// Read the text of a SIZE reply (RFC 3659 section 4): the size in
+// octets.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_size("1048576")
+//         Ok(n)  => println("${n}")   // 1048576
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_size(text: Str) -> Result<Int, FtpError>
+    let n = parse_number(str.trim(text))
+    if n < 0
+        return Err(FtpBadSize(text))
+    Ok(n)
+
+// Read the text of an MDTM reply (RFC 3659 section 2.3):
+// `YYYYMMDDHHMMSS` in UTC, and optionally a dot and fractions of a
+// second.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     match ftpwire.parse_mdtm("20240229123045.5")
+//         Ok(t)  => println("${t.year}-${t.month}-${t.day} ${t.hour}:${t.minute}:${t.second} .${t.fraction}")   // 2024-2-29 12:30:45 .5
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_mdtm(text: Str) -> Result<FtpTimestamp, FtpError>
+    let s = str.trim(text)
+    let dot = str.index(s, ".") ?? str.len(s)
+    let digits = str.slice(s, 0, dot)
+    let fraction = str.slice(s, dot + 1, str.len(s))
+    let bad = str.len(digits) != 14 or dot < str.len(s) and (str.len(fraction) == 0 or parse_number(fraction) < 0)
+    let t = FtpTimestamp { year: parse_number(str.slice(digits, 0, 4)), month: parse_number(str.slice(digits, 4, 6)),
+                           day: parse_number(str.slice(digits, 6, 8)), hour: parse_number(str.slice(digits, 8, 10)),
+                           minute: parse_number(str.slice(digits, 10, 12)), second: parse_number(str.slice(digits, 12, 14)),
+                           fraction: fraction }
+    if bad or t.year < 0 or t.month < 1 or t.month > 12 or t.day < 1 or t.day > 31 or t.hour < 0 or t.hour > 23
+        or t.minute < 0 or t.minute > 59 or t.second < 0 or t.second > 60
+        return Err(FtpBadTimestamp(text))
+    Ok(t)
+
+// The features of a FEAT reply (RFC 2389 section 3.2): the lines between
+// the first and the last of the multi-line reply, each with its leading
+// space removed.  A single-line reply lists none.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     let f = ftpwire.parse_features(["Extensions supported:", " UTF8", " MLST type*;size*;", "End"])
+//     println(str.join(f, "|"))   // UTF8|MLST type*;size*;
+// ```
+pub fn parse_features(lines: [Str]) -> [Str]
+    if list.len(lines) < 3
+        return []
+    list.map(lines[1:list.len(lines) - 1], l => str.trim(l))
+
+// Whether a feature list holds `name`, compared without regard to case:
+// the first word of a feature is its name (RFC 2389 section 3.2).
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     println("${ftpwire.has_feature(["UTF8", "MLST size*;"], "mlst")}")   // true
+// ```
+pub fn has_feature(features: [Str], name: Str) -> Bool
+    let want = str.upper(name)
+    list.any(features, f => str.upper(first_word(f)) == want)
+
+// The text after the name of the first feature called `name`, or "".
+// `MLST type*;size*;` has the argument `type*;size*;`.
+//
+// ```novo
+// use ftpwire
+//
+// fn main() [io]
+//     println(ftpwire.feature_arg(["UTF8", "MLST type*;size*;"], "MLST"))   // type*;size*;
+// ```
+pub fn feature_arg(features: [Str], name: Str) -> Str
+    let want = str.upper(name)
+    for f in features
+        if str.upper(first_word(f)) == want
+            return str.trim(str.slice(f, str.len(first_word(f)), str.len(f)))
+    ""
+
+// The first word of a line.
+fn first_word(s: Str) -> Str
+    let w = str.words(s)
+    if list.len(w) == 0
+        return ""
+    w[0]

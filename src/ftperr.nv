@@ -1,0 +1,82 @@
+// ftperr.nv — the refusals an FTP reply, command, listing or call can meet.
+//
+// A reply that is cut short is not one of them: on a stream the caller
+// reads more bytes and the session waits.  A reply of 4yz or 5yz is not
+// one either: it is the server saying no, and the session reports it as
+// an event.  Every variant here is a fault in the bytes, in an argument
+// or in the order of calls.
+
+use std.str
+
+// Why a line was not read, a command was not written or a call was not
+// allowed.
+pub enum FtpError
+    // A line that is not a reply: it does not begin with three digits
+    // from 100 to 599 followed by a space, a hyphen or the end of the
+    // line (RFC 959 section 4.2).
+    FtpBadReply(line: Str)
+    // A line, or a multi-line reply, longer than the limit.
+    FtpReplyTooLong(limit: Int)
+    // The text of a 227 reply holds no six numbers of 0 to 255.
+    FtpBadPassive(text: Str)
+    // The text of a 229 reply is not `(|||port|)` with a port from 1 to
+    // 65535 (RFC 2428 section 3).
+    FtpBadExtendedPassive(text: Str)
+    // The text of a 257 reply does not begin with a quoted path
+    // (RFC 959 section 5, the PWD reply).
+    FtpBadPath(text: Str)
+    // The text of a SIZE reply is not a non-negative number.
+    FtpBadSize(text: Str)
+    // The text of an MDTM reply is not `YYYYMMDDHHMMSS`, optionally
+    // followed by a dot and digits (RFC 3659 section 2.3).
+    FtpBadTimestamp(text: Str)
+    // A line of an MLSD or MLST answer with no fact list and name
+    // (RFC 3659 section 7.2).
+    FtpBadFact(line: Str)
+    // A line of a LIST answer in neither the Unix nor the DOS format.
+    FtpBadListLine(line: Str)
+    // An argument that holds a CR, an LF, a NUL or the byte 0xFF, or is
+    // empty where the command needs one.  `what` names the command.
+    FtpBadArgument(what: Str)
+    // A command line longer than 4096 octets with its CRLF.
+    FtpCommandTooLong(length: Int)
+    // A restart offset below 0, a port outside 1 to 65535 or a protocol
+    // number other than 1 and 2.
+    FtpBadNumber(value: Int)
+    // A host for PORT that is not four decimal numbers of 0 to 255, or
+    // for EPRT that holds a `|` or is empty.
+    FtpBadHost(text: Str)
+    // A command that does not belong to the phase the session is in.
+    FtpWrongState(command: Str, phase: Str)
+    // A command sent while the answer to the last one has not arrived.
+    FtpBusy(command: Str)
+    // A reply when no command was waiting for one.
+    FtpUnsolicited(code: Int, text: Str)
+    // A first reply that is not 220 (or 120 followed by 220).
+    FtpBadGreeting(code: Int)
+    // Bytes handed to a session that has ended.
+    FtpEnded
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.  `Result<_, FtpError>` requires it.
+impl Error for FtpError
+    fn message(self) -> Str
+        match self
+            FtpBadReply(line)             => "the line \"" + line + "\" is not an FTP reply"
+            FtpReplyTooLong(limit)        => "a reply is longer than the limit of " + str.from_int(limit) + " octets"
+            FtpBadPassive(text)           => "\"" + text + "\" holds no host and port for passive mode"
+            FtpBadExtendedPassive(text)   => "\"" + text + "\" is not an extended passive port"
+            FtpBadPath(text)              => "\"" + text + "\" does not begin with a quoted path"
+            FtpBadSize(text)              => "\"" + text + "\" is not a size"
+            FtpBadTimestamp(text)         => "\"" + text + "\" is not a modification time"
+            FtpBadFact(line)              => "\"" + line + "\" is not a list of facts and a name"
+            FtpBadListLine(line)          => "\"" + line + "\" is in neither the Unix nor the DOS listing format"
+            FtpBadArgument(what)          => "the argument of " + what + " is empty or holds a CR, an LF, a NUL or 0xFF"
+            FtpCommandTooLong(length)     => "a command of " + str.from_int(length) + " octets is over 4096"
+            FtpBadNumber(value)           => str.from_int(value) + " is not a valid offset, port or protocol number"
+            FtpBadHost(text)              => "\"" + text + "\" is not a usable host address"
+            FtpWrongState(command, phase) => command + " is not allowed in the " + phase + " state"
+            FtpBusy(command)              => command + " cannot be sent while the last command is unanswered"
+            FtpUnsolicited(code, text)    => "the reply " + str.from_int(code) + " \"" + text + "\" arrived and no command was waiting"
+            FtpBadGreeting(code)          => "the first reply is " + str.from_int(code) + " and not 220"
+            FtpEnded                      => "the session has ended"

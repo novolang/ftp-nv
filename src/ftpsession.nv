@@ -1,0 +1,593 @@
+// ftpsession.nv — the control connection of RFC 959 as a step a caller
+// drives, with no socket.
+//
+// THE LOOP is two calls on the control connection.  `send` takes a
+// command and answers the bytes to write.  `feed` takes the bytes that
+// came from the server and answers the events they completed.  The caller
+// owns the sockets, the TLS and the clock.
+//
+// THE DATA CONNECTION IS THE CALLER'S.  FTP moves a file or a listing on
+// a second connection (RFC 959 section 3.2).  The session never touches
+// it.  The order for a download in passive mode is:
+//
+//   1. `send` PASV or EPSV; the `FtpPassive` event names the address.
+//   2. The caller connects to that address.  For EPSV the event gives
+//      only the port and the host is the one the control connection went
+//      to.
+//   3. `send` TYPE I (once) and then RETR, LIST, NLST or MLSD, with REST
+//      before RETR to resume (RFC 959 section 4.1.3).
+//   4. The server answers 150 or 125, an `FtpPreliminary` event, and the
+//      caller reads the data connection until the server closes it.
+//   5. The server answers 226, an `FtpOk` event, on the control
+//      connection.  The transfer is complete.
+//
+// STOR and APPE are the same with the caller writing and closing.  An
+// active-mode transfer, PORT or EPRT, has the caller listen first and
+// then `send` the command; the connection arrives after the 150.
+//
+// ONE COMMAND AT A TIME.  The session refuses a second command while the
+// first is unanswered, with `FtpBusy`.  A command with a data transfer is
+// unanswered until its final reply, 2yz or 4yz or 5yz, which can come
+// after the data has ended.  A 1yz reply is `FtpPreliminary` and does not
+// settle the command.
+//
+// REPLIES of several lines are gathered and handed over as one event
+// (RFC 959 section 4.2).  The text of an event is the lines joined by
+// `\n`.
+//
+// A 421 reply at any time means the server is closing the control
+// connection (RFC 959 section 4.2).  The session ends after it.  A fault
+// in the bytes also ends the session, with an `FtpFailed` event.
+
+use std.bytes
+use std.str
+use ftperr
+use ftplist
+use ftpwire
+
+// The phase before the greeting has arrived.
+pub const FTP_PHASE_GREETING = 0
+// The phase after the greeting and before a login succeeded.
+pub const FTP_PHASE_CONNECTED = 1
+// The phase after the server accepted a login (230).
+pub const FTP_PHASE_LOGGED_IN = 2
+// The phase after QUIT, a 421 or a fault.
+pub const FTP_PHASE_ENDED = 3
+
+// The longest line of a reply, in octets: 4096.
+pub const FTP_LINE_MAX = 4096
+// The longest reply, in octets across all its lines: 65536.
+pub const FTP_REPLY_MAX = 65536
+
+// What the client sends.
+pub enum FtpCommand
+    // `USER name`.
+    FtpCmdUser(name: Str)
+    // `PASS password`.
+    FtpCmdPass(password: Str)
+    // `ACCT information`, for a server that answers PASS with 332.
+    FtpCmdAcct(information: Str)
+    // `AUTH mechanism`: `TLS` (RFC 4217 section 4).  When the server
+    // answers 234 the caller starts TLS and calls `tls_started`.
+    FtpCmdAuth(mechanism: Str)
+    // `PBSZ size`: protection buffer size, 0 with TLS (RFC 4217 section
+    // 8).
+    FtpCmdPbsz(size: Int)
+    // `PROT level`: `C` clear or `P` private for the data connection
+    // (RFC 4217 section 9).
+    FtpCmdProt(level: Str)
+    // `CWD path`.
+    FtpCmdCwd(path: Str)
+    // `CDUP`.
+    FtpCmdCdup
+    // `PWD`.
+    FtpCmdPwd
+    // `MKD path`.
+    FtpCmdMkd(path: Str)
+    // `RMD path`.
+    FtpCmdRmd(path: Str)
+    // `DELE path`.
+    FtpCmdDele(path: Str)
+    // `RNFR path`, to be followed by `FtpCmdRnto`.
+    FtpCmdRnfr(path: Str)
+    // `RNTO path`.
+    FtpCmdRnto(path: Str)
+    // `TYPE code`: `A` for ASCII, `I` for image (binary).
+    FtpCmdType(code: Str)
+    // `MODE code`: `S` for stream, the only mode this package supports.
+    FtpCmdMode(code: Str)
+    // `STRU code`: `F` for file, the only structure this package
+    // supports.
+    FtpCmdStru(code: Str)
+    // `PASV`.
+    FtpCmdPasv
+    // `EPSV`, or `EPSV argument` where the argument is `1`, `2` or `ALL`
+    // (RFC 2428 section 3).  An empty argument sends none.
+    FtpCmdEpsv(argument: Str)
+    // `PORT h1,h2,h3,h4,p1,p2` for an IPv4 `host` in dotted decimal.
+    FtpCmdPort(host: Str, port: Int)
+    // `EPRT |protocol|host|port|` (RFC 2428 section 2).
+    FtpCmdEprt(protocol: Int, host: Str, port: Int)
+    // `RETR path`.
+    FtpCmdRetr(path: Str)
+    // `STOR path`.
+    FtpCmdStor(path: Str)
+    // `APPE path`.
+    FtpCmdAppe(path: Str)
+    // `REST offset`, the byte to resume at (RFC 3659 section 5).
+    FtpCmdRest(offset: Int)
+    // `LIST`, or `LIST path` when the path is not empty.
+    FtpCmdList(path: Str)
+    // `NLST`, or `NLST path`.
+    FtpCmdNlst(path: Str)
+    // `MLSD`, or `MLSD path` (RFC 3659 section 7).
+    FtpCmdMlsd(path: Str)
+    // `MLST`, or `MLST path`.
+    FtpCmdMlst(path: Str)
+    // `SIZE path` (RFC 3659 section 4).
+    FtpCmdSize(path: Str)
+    // `MDTM path` (RFC 3659 section 3).
+    FtpCmdMdtm(path: Str)
+    // `FEAT` (RFC 2389 section 3).
+    FtpCmdFeat
+    // `OPTS command options` (RFC 2389 section 4).  `options` may be
+    // empty.
+    FtpCmdOpts(command: Str, options: Str)
+    // `SYST`.
+    FtpCmdSyst
+    // `NOOP`.
+    FtpCmdNoop
+    // `QUIT`.
+    FtpCmdQuit
+
+// What the server's bytes completed.
+pub enum FtpEvent
+    // The 220 greeting.
+    FtpGreeting(text: Str)
+    // A 230 reply to USER, PASS or ACCT: the login succeeded.
+    FtpLoggedIn(text: Str)
+    // A 1yz reply: the transfer is starting.  The command is still
+    // unanswered.
+    FtpPreliminary(command: Str, code: Int, text: Str)
+    // A 3yz reply: the server wants another command.  331 after USER
+    // wants PASS, 332 wants ACCT, 350 after REST or RNFR wants the
+    // command it was for.
+    FtpIntermediate(command: Str, code: Int, text: Str)
+    // A 2yz reply with nothing more to read in it.
+    FtpOk(command: Str, code: Int, text: Str)
+    // The address in a 227 or 229 reply.  `host` is "" for 229.
+    FtpPassive(host: Str, port: Int)
+    // The path in the 257 reply to PWD or MKD.
+    FtpWorkingDir(command: Str, path: Str)
+    // The answer to SIZE.
+    FtpSize(octets: Int)
+    // The answer to MDTM.
+    FtpModified(modified: FtpTimestamp)
+    // The answer to FEAT, one line per feature, leading space removed.
+    FtpFeatures(features: [Str])
+    // The answer to MLST.
+    FtpFacts(entry: FtpEntry)
+    // The 234 reply to AUTH: start TLS now, then call `tls_started`.
+    FtpTlsReady
+    // The 221 reply to QUIT.  The session has ended.
+    FtpBye(text: Str)
+    // A 4yz or 5yz reply.  The session carries on unless the code is
+    // 421.
+    FtpRefused(command: Str, code: Int, text: Str)
+    // The bytes were not FTP.  The session has ended.
+    FtpFailed(error: FtpError)
+
+// The state of one control connection.
+pub struct FtpClient
+    // One of the `FTP_PHASE_` values.
+    var phase: Int
+    // The bytes received that do not yet make a whole line.
+    var inbuf: [u8]
+    // The keyword of the command in flight, or "".
+    var pending: Str
+    // The code of the multi-line reply being gathered, or 0.
+    var rcode: Int
+    // The lines of the multi-line reply so far.
+    var rlines: [Str]
+    // The octets in those lines.
+    var rsize: Int
+    // The features from the last FEAT answer.
+    var features: [Str]
+
+// A session before the greeting.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     let c = ftpsession.new_client()
+//     println(ftpsession.phase_name(c.phase))   // greeting
+// ```
+pub fn new_client() -> FtpClient
+    FtpClient { phase: FTP_PHASE_GREETING,
+        inbuf: [],
+        pending: "",
+        rcode: 0,
+        rlines: [],
+        rsize: 0,
+        features: [] }
+
+// The name of a phase, for a sentence.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     println(ftpsession.phase_name(ftpsession.FTP_PHASE_LOGGED_IN))   // logged in
+// ```
+pub fn phase_name(phase: Int) -> Str
+    match phase
+        0 => "greeting"
+        1 => "connected"
+        2 => "logged in"
+        _ => "ended"
+
+// The features the server listed in its last FEAT answer, or none before
+// one has arrived and after the start of TLS.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     let c = ftpsession.new_client()
+//     println("${list.len(ftpsession.features(c))}")   // 0
+// ```
+pub fn features(c: FtpClient) -> [Str]
+    c.features[:]
+
+// Tell the session that TLS has started after the 234 reply to AUTH.
+// The features are forgotten, because the server may list others now
+// (RFC 4217 section 4), and bytes held from before TLS are dropped.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     var c = ftpsession.new_client()
+//     ftpsession.tls_started(var c)
+//     println(ftpsession.phase_name(c.phase))   // greeting
+// ```
+pub fn tls_started(var c: FtpClient)
+    c.features = []
+    c.inbuf = []
+
+// The keyword of a command.
+fn keyword_of(cmd: FtpCommand) -> Str
+    match cmd
+        FtpCmdUser(_)       => "USER"
+        FtpCmdPass(_)       => "PASS"
+        FtpCmdAcct(_)       => "ACCT"
+        FtpCmdAuth(_)       => "AUTH"
+        FtpCmdPbsz(_)       => "PBSZ"
+        FtpCmdProt(_)       => "PROT"
+        FtpCmdCwd(_)        => "CWD"
+        FtpCmdCdup          => "CDUP"
+        FtpCmdPwd           => "PWD"
+        FtpCmdMkd(_)        => "MKD"
+        FtpCmdRmd(_)        => "RMD"
+        FtpCmdDele(_)       => "DELE"
+        FtpCmdRnfr(_)       => "RNFR"
+        FtpCmdRnto(_)       => "RNTO"
+        FtpCmdType(_)       => "TYPE"
+        FtpCmdMode(_)       => "MODE"
+        FtpCmdStru(_)       => "STRU"
+        FtpCmdPasv          => "PASV"
+        FtpCmdEpsv(_)       => "EPSV"
+        FtpCmdPort(_, _)    => "PORT"
+        FtpCmdEprt(_, _, _) => "EPRT"
+        FtpCmdRetr(_)       => "RETR"
+        FtpCmdStor(_)       => "STOR"
+        FtpCmdAppe(_)       => "APPE"
+        FtpCmdRest(_)       => "REST"
+        FtpCmdList(_)       => "LIST"
+        FtpCmdNlst(_)       => "NLST"
+        FtpCmdMlsd(_)       => "MLSD"
+        FtpCmdMlst(_)       => "MLST"
+        FtpCmdSize(_)       => "SIZE"
+        FtpCmdMdtm(_)       => "MDTM"
+        FtpCmdFeat          => "FEAT"
+        FtpCmdOpts(_, _)    => "OPTS"
+        FtpCmdSyst          => "SYST"
+        FtpCmdNoop          => "NOOP"
+        FtpCmdQuit          => "QUIT"
+
+// Whether a command may be sent before a login has succeeded.
+fn before_login(cmd: FtpCommand) -> Bool
+    match cmd
+        FtpCmdUser(_)    => true
+        FtpCmdPass(_)    => true
+        FtpCmdAcct(_)    => true
+        FtpCmdAuth(_)    => true
+        FtpCmdPbsz(_)    => true
+        FtpCmdProt(_)    => true
+        FtpCmdFeat       => true
+        FtpCmdOpts(_, _) => true
+        FtpCmdSyst       => true
+        FtpCmdNoop       => true
+        FtpCmdQuit       => true
+        _                => false
+
+// An argument that must not be empty.
+fn required(verb: Str, arg: Str) -> Result<Str, FtpError>
+    if str.len(arg) == 0
+        return Err(FtpBadArgument(verb))
+    Ok(arg)
+
+// A number that must be at least `low`.
+fn at_least(low: Int, n: Int) -> Result<Str, FtpError>
+    if n < low
+        return Err(FtpBadNumber(n))
+    Ok(str.from_int(n))
+
+// The argument a command carries, "" for none, or why it cannot be sent.
+fn argument_of(cmd: FtpCommand) -> Result<Str, FtpError>
+    let verb = keyword_of(cmd)
+    match cmd
+        FtpCmdUser(a)       => required(verb, a)
+        FtpCmdPass(a)       => required(verb, a)
+        FtpCmdAcct(a)       => required(verb, a)
+        FtpCmdAuth(a)       => required(verb, a)
+        FtpCmdPbsz(n)       => at_least(0, n)
+        FtpCmdProt(a)       => required(verb, a)
+        FtpCmdCwd(a)        => required(verb, a)
+        FtpCmdMkd(a)        => required(verb, a)
+        FtpCmdRmd(a)        => required(verb, a)
+        FtpCmdDele(a)       => required(verb, a)
+        FtpCmdRnfr(a)       => required(verb, a)
+        FtpCmdRnto(a)       => required(verb, a)
+        FtpCmdType(a)       => required(verb, a)
+        FtpCmdMode(a)       => required(verb, a)
+        FtpCmdStru(a)       => required(verb, a)
+        FtpCmdEpsv(a)       => Ok(a)
+        FtpCmdPort(h, p)    => ftpwire.port_argument(h, p)
+        FtpCmdEprt(q, h, p) => ftpwire.eprt_argument(q, h, p)
+        FtpCmdRetr(a)       => required(verb, a)
+        FtpCmdStor(a)       => required(verb, a)
+        FtpCmdAppe(a)       => required(verb, a)
+        FtpCmdRest(n)       => at_least(0, n)
+        FtpCmdList(a)       => Ok(a)
+        FtpCmdNlst(a)       => Ok(a)
+        FtpCmdMlsd(a)       => Ok(a)
+        FtpCmdMlst(a)       => Ok(a)
+        FtpCmdSize(a)       => required(verb, a)
+        FtpCmdMdtm(a)       => required(verb, a)
+        FtpCmdOpts(c, o)    => Ok(required(verb, c)! + (if str.len(o) == 0 then "" else " " + o))
+        _                   => Ok("")
+
+// Build the line for a command and note that its answer is awaited.
+//
+// Answers the bytes to write to the control connection.  A command in
+// the wrong phase is `FtpWrongState`: nothing before the greeting, and
+// after the greeting only the commands that log in and ask about the
+// server until a login has succeeded.  A command sent before the last
+// was answered is `FtpBusy`.  An empty path, an argument with a CR, an LF,
+// a NUL or 0xFF, a negative offset, a bad port or host is refused by name.
+// A refused command leaves the session unchanged.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     var c = ftpsession.new_client()
+//     let _e = ftpsession.feed(var c, [50, 50, 48, 32, 104, 105, 13, 10])
+//     match ftpsession.send(var c, FtpCmdUser("anonymous"))
+//         Ok(b)  => println("${list.len(b)}")   // 16
+//         Err(e) => println(e.message())
+// ```
+pub fn send(var c: FtpClient, cmd: FtpCommand) -> Result<[u8], FtpError>
+    let verb = keyword_of(cmd)
+    if c.phase == FTP_PHASE_GREETING or c.phase == FTP_PHASE_ENDED
+        return Err(FtpWrongState(verb, phase_name(c.phase)))
+    if str.len(c.pending) > 0
+        return Err(FtpBusy(verb))
+    if c.phase != FTP_PHASE_LOGGED_IN and not before_login(cmd)
+        return Err(FtpWrongState(verb, phase_name(c.phase)))
+    let line = ftpwire.encode_command(verb, argument_of(cmd)!)!
+    c.pending = verb
+    Ok(line)
+
+// End the session on a fault.
+fn fail(var c: FtpClient, e: FtpError, var events: [FtpEvent]) -> Bool
+    c.phase = FTP_PHASE_ENDED
+    c.pending = ""
+    c.rcode = 0
+    c.rlines = []
+    list.push(events, FtpFailed(e))
+    false
+
+// The command in flight is answered.
+fn settle(var c: FtpClient)
+    c.pending = ""
+
+// The events for a 2yz reply to the command in flight.  Answers false
+// when the session ended.
+fn completed(var c: FtpClient, code: Int, lines: [Str], var events: [FtpEvent]) -> Bool
+    let cmd = c.pending
+    let text = str.join(lines, "\n")
+    settle(var c)
+    if cmd == "PASV" and code == 227
+        match ftpwire.parse_passive(text)
+            Ok(a)  => list.push(events, FtpPassive(a.host, a.port))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif cmd == "EPSV" and code == 229
+        match ftpwire.parse_extended_passive(text)
+            Ok(p)  => list.push(events, FtpPassive("", p))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif (cmd == "PWD" or cmd == "MKD") and code == 257
+        match ftpwire.parse_quoted_path(text)
+            Ok(p)  => list.push(events, FtpWorkingDir(cmd, p))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif cmd == "SIZE" and code == 213
+        match ftpwire.parse_size(text)
+            Ok(n)  => list.push(events, FtpSize(n))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif cmd == "MDTM" and code == 213
+        match ftpwire.parse_mdtm(text)
+            Ok(t)  => list.push(events, FtpModified(t))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif cmd == "FEAT" and code == 211
+        c.features = ftpwire.parse_features(lines)
+        list.push(events, FtpFeatures(c.features[:]))
+    elif cmd == "MLST" and code == 250
+        match mlst_entry(lines, text)
+            Ok(e)  => list.push(events, FtpFacts(e))
+            Err(e) =>
+                return fail(var c, e, var events)
+    elif cmd == "AUTH" and code == 234
+        list.push(events, FtpTlsReady)
+    elif cmd == "QUIT"
+        c.phase = FTP_PHASE_ENDED
+        list.push(events, FtpBye(text))
+    elif code == 230 and (cmd == "USER" or cmd == "PASS" or cmd == "ACCT")
+        c.phase = FTP_PHASE_LOGGED_IN
+        list.push(events, FtpLoggedIn(text))
+    else
+        list.push(events, FtpOk(cmd, code, text))
+    true
+
+// The entry in the lines of an MLST reply: the line after the first,
+// which begins with the space that marks a continuation line.
+fn mlst_entry(lines: [Str], text: Str) -> Result<FtpEntry, FtpError>
+    if list.len(lines) < 3
+        return Err(FtpBadFact(text))
+    let l = lines[1]
+    ftplist.parse_facts((if str.starts_with(l, " ") then str.slice(l, 1, str.len(l)) else l))
+
+// A whole reply: a code and its lines.  Answers false when the session
+// ended.
+fn reply(var c: FtpClient, code: Int, lines: [Str], var events: [FtpEvent]) -> Bool
+    let text = str.join(lines, "\n")
+    let class = ftpwire.reply_class(code)
+    if c.phase == FTP_PHASE_GREETING
+        return greeting(var c, code, text, var events)
+    if class == 1 and str.len(c.pending) > 0
+        list.push(events, FtpPreliminary(c.pending, code, text))
+        return true
+    if str.len(c.pending) == 0 and code != 421
+        return fail(var c, FtpUnsolicited(code, text), var events)
+    if class >= 4
+        list.push(events, FtpRefused(c.pending, code, text))
+        settle(var c)
+        if code == 421
+            c.phase = FTP_PHASE_ENDED
+            return false
+        return true
+    if class == 3
+        list.push(events, FtpIntermediate(c.pending, code, text))
+        settle(var c)
+        return true
+    completed(var c, code, lines, var events)
+
+// The first reply.
+fn greeting(var c: FtpClient, code: Int, text: Str, var events: [FtpEvent]) -> Bool
+    if code == 120
+        list.push(events, FtpPreliminary("", code, text))
+        return true
+    if code == 421
+        list.push(events, FtpRefused("", code, text))
+        c.phase = FTP_PHASE_ENDED
+        return false
+    if code != 220
+        return fail(var c, FtpBadGreeting(code), var events)
+    c.phase = FTP_PHASE_CONNECTED
+    list.push(events, FtpGreeting(text))
+    true
+
+// Add a line to the reply being gathered, or end it.  Answers false when
+// the session ended.
+fn gather(var c: FtpClient, line: Str, var events: [FtpEvent]) -> Bool
+    if ftpwire.ends_reply(c.rcode, line)
+        let code = c.rcode
+        var lines = c.rlines[:]
+        list.push(lines, (if str.len(line) > 4 then str.slice(line, 4, str.len(line)) else ""))
+        c.rcode = 0
+        c.rlines = []
+        c.rsize = 0
+        return reply(var c, code, lines, var events)
+    c.rsize = c.rsize + str.len(line) + 2
+    if c.rsize > FTP_REPLY_MAX
+        return fail(var c, FtpReplyTooLong(FTP_REPLY_MAX), var events)
+    list.push(c.rlines, line)
+    true
+
+// One line of the received buffer.  Answers false when the session ended.
+fn take_line(var c: FtpClient, line: Str, var events: [FtpEvent]) -> Bool
+    if c.rcode > 0
+        return gather(var c, line, var events)
+    match ftpwire.parse_reply_line(line)
+        Err(e) => fail(var c, e, var events)
+        Ok(r)  =>
+            if r.last
+                return reply(var c, r.code, [r.text], var events)
+            c.rcode = r.code
+            c.rlines = [r.text]
+            c.rsize = str.len(line) + 2
+            true
+
+// The offset of the first LF at or after `from`, or -1.
+fn find_lf(buf: [u8], from: Int) -> Int
+    for i in from..list.len(buf)
+        if buf[i] == 10
+            return i
+    -1
+
+// Hand the session bytes read from the control connection.
+//
+// Answers the events the bytes completed, in order, possibly none: a read
+// may hold half a line or several replies.  A line ends at LF, and a CR
+// before it is dropped.  A line longer than `FTP_LINE_MAX` ends the
+// session, and so does a multi-line reply of more than `FTP_REPLY_MAX`.
+// Bytes after the session has ended are not read; the answer is one
+// `FtpFailed` naming `FtpEnded`.
+//
+// ```novo
+// use ftpsession
+//
+// fn main() [io]
+//     var c = ftpsession.new_client()
+//     let ev = ftpsession.feed(var c, [50, 50, 48, 32, 104, 105, 13, 10])
+//     println("${list.len(ev)}")   // 1
+// ```
+pub fn feed(var c: FtpClient, data: [u8]) -> [FtpEvent]
+    var events: [FtpEvent] = []
+    if c.phase == FTP_PHASE_ENDED
+        list.push(events, FtpFailed(FtpEnded))
+        return events
+    for b in data
+        list.push(c.inbuf, b)
+    var pos = 0
+    var going = true
+    while going
+        let lf = find_lf(c.inbuf, pos)
+        if lf < 0
+            if list.len(c.inbuf) - pos > FTP_LINE_MAX
+                going = fail(var c, FtpReplyTooLong(FTP_LINE_MAX), var events)
+            else
+                going = false
+        else
+            let hi = if lf > pos and c.inbuf[lf - 1] == 13
+                lf - 1
+            else
+                lf
+            let line = bytes.byte_list_to_str(c.inbuf[pos:hi])
+            let long = hi - pos > FTP_LINE_MAX
+            pos = lf + 1
+            if long
+                going = fail(var c, FtpReplyTooLong(FTP_LINE_MAX), var events)
+            else
+                going = take_line(var c, line, var events)
+    if c.phase == FTP_PHASE_ENDED
+        c.inbuf = []
+    else
+        c.inbuf = c.inbuf[pos:]
+    events

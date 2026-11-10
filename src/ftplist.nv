@@ -1,0 +1,280 @@
+// ftplist.nv — the lines of a directory listing, read into entries.
+//
+// TWO FAMILIES.  MLSD and MLST (RFC 3659 section 7) give each entry as a
+// list of `name=value;` facts, a space and the name.  They are made to be
+// read by a program, and `parse_facts` reads them exactly.
+//
+// LIST is what RFC 959 section 4.1.3 left to the server, and servers wrote
+// what their operating system's `ls` or `dir` wrote.  `parse_unix` reads
+// the long format of `ls -l`, and `parse_dos` reads the format of the
+// Windows IIS server.  Both are BEST EFFORT: a line they do not
+// recognise is refused or skipped, and the dates they hold are text, not
+// instants, because the format gives no year for a recent file and no
+// time zone at all.  A program that can use MLSD should.
+
+use std.bytes
+use std.str
+use ftperr
+use ftpwire
+
+// One entry of a directory.
+pub struct FtpEntry
+    // The name, without the directory.
+    name: Str
+    // "file", "dir", "link", "cdir" (the directory listed), "pdir" (its
+    // parent), "other" for a device or a socket, or the value of the
+    // MLSD `type` fact in lower case.
+    kind: Str
+    // The size in octets, or -1 when the line does not give one.
+    size: Int
+    // The modification time as the line wrote it: `20240229123045` from
+    // MLSD, `Feb 29 12:30` or `Feb 29  2024` from a Unix listing,
+    // `02-29-24 12:30PM` from a DOS one.  "" when absent.
+    modify: Str
+    // The permissions as the line wrote them: `-rw-r--r--` from a Unix
+    // listing, the `perm` fact from MLSD.  "" when absent.
+    perm: Str
+    // For a symbolic link, the path it points to, or "".
+    target: Str
+    // Every fact of an MLSD line as `name=value`, names in lower case.
+    // Empty for a LIST line.
+    facts: [Str]
+
+// The entries read from a listing, and how many lines were not entries.
+pub struct FtpListing
+    // The entries, in the order they were sent.
+    entries: [FtpEntry]
+    // The lines that were neither an entry nor a `total` line.
+    skipped: Int
+
+// The months a Unix listing names, as `ls` writes them.
+fn months() -> [Str]
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// The value of the fact called `name` in a list of `name=value`, or "".
+fn fact_value(facts: [Str], name: Str) -> Str
+    for f in facts
+        if str.starts_with(f, name + "=")
+            return str.slice(f, str.len(name) + 1, str.len(f))
+    ""
+
+// Read one MLSD or MLST line (RFC 3659 section 7.2): the facts, each
+// ending in `;`, one space, and the name.  A line may begin with the
+// space when it has no facts.  The kind is the `type` fact; a
+// `type=OS.unix=slink:/target` is a link with its target.
+//
+// ```novo
+// use ftplist
+//
+// fn main() [io]
+//     match ftplist.parse_facts("type=file;size=1024;modify=20240229123045; my file.txt")
+//         Ok(e)  => println("${e.name} ${e.kind} ${e.size}")   // my file.txt file 1024
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_facts(line: Str) -> Result<FtpEntry, FtpError>
+    let at = str.index(line, " ") ?? -1
+    if at < 0 or at + 1 >= str.len(line)
+        return Err(FtpBadFact(line))
+    let facts = list.map(list.filter(str.split(str.slice(line, 0, at), ";"), f => str.len(f) > 0),
+                         f => fact_lower(f))
+    let raw = fact_value(facts, "type")
+    let kind = str.lower(raw)
+    let is_link = str.starts_with(kind, "os.unix=slink")
+    let target = if is_link
+        str.slice(raw, (str.index(raw, ":") ?? str.len(raw) - 1) + 1, str.len(raw))
+    else
+        ""
+    let size = ftpwire.parse_number(fact_value(facts, "size"))
+    Ok(FtpEntry { name: str.slice(line, at + 1, str.len(line)), kind: (if is_link then "link" else kind),
+                  size: size, modify: fact_value(facts, "modify"), perm: fact_value(facts, "perm"),
+                  target: target, facts: facts })
+
+// A fact with its name in lower case and its value as sent.
+fn fact_lower(f: Str) -> Str
+    match str.index(f, "=")
+        None     => str.lower(f) + "="
+        Some(eq) => str.lower(str.slice(f, 0, eq)) + str.slice(f, eq, str.len(f))
+
+// Whether `w` is an `ls` month name.
+fn is_month(w: Str) -> Bool
+    list.contains(months(), w)
+
+// Whether `w` is the time or the year that ends the date of an `ls`
+// line: `12:30` or `2024`.
+fn is_time_or_year(w: Str) -> Bool
+    let n = str.len(w)
+    if n == 4
+        return ftpwire.parse_number(w) >= 0
+    n == 5 and str.byte_at_or(w, 2, 0) == 58 and ftpwire.parse_number(str.slice(w, 0, 2)) >= 0
+        and ftpwire.parse_number(str.slice(w, 3, 5)) >= 0
+
+// The offset just past the `n`th word of `s`, counting words as runs of
+// bytes that are not a space or a tab.  The length of `s` if it has
+// fewer.
+fn word_end(s: Str, n: Int) -> Int
+    var seen = 0
+    var in_word = false
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        let gap = b == 32 or b == 9
+        if in_word and gap
+            seen = seen + 1
+            if seen == n
+                return i
+        in_word = not gap
+    str.len(s)
+
+// The text after the `n`th word and one whitespace byte: a name, which
+// may itself hold spaces.
+fn rest_after(s: Str, n: Int) -> Str
+    str.slice(s, word_end(s, n) + 1, str.len(s))
+
+// The kind a Unix mode string's first character stands for.
+fn unix_kind(c: Int) -> Str
+    if c == 45
+        return "file"
+    if c == 100
+        return "dir"
+    if c == 108
+        return "link"
+    "other"
+
+// The index of the month word in an `ls` line, or -1: a month whose
+// neighbours are a size before it and a day and a time or year after it.
+fn month_index(w: [Str]) -> Int
+    for k in 3..list.len(w) - 2
+        if is_month(w[k]) and ftpwire.parse_number(w[k - 1]) >= 0 and ftpwire.parse_number(w[k + 1]) >= 0
+            and is_time_or_year(w[k + 2])
+            return k
+    -1
+
+// Read one line of the long format of `ls -l`:
+// `-rw-r--r--   1 owner group     1234 Jan 12 10:30 file name.txt`.
+// The mode string is ten characters, an eleventh `+` or `.` being
+// allowed; the owner and the group are skipped; the size, the date and
+// the name are read.  A name that holds spaces is kept whole, and a link
+// `name -> target` is split.
+//
+// ```novo
+// use ftplist
+//
+// fn main() [io]
+//     match ftplist.parse_unix("drwxr-xr-x   2 ftp ftp 4096 Jan  1  2020 pub")
+//         Ok(e)  => println("${e.name} ${e.kind} ${e.size}")   // pub dir 4096
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_unix(line: Str) -> Result<FtpEntry, FtpError>
+    let w = str.words(line)
+    let k = month_index(w)
+    if k < 0 or str.len(w[0]) < 10 or str.index("-dlbcps", str.slice(w[0], 0, 1)) == None
+        return Err(FtpBadListLine(line))
+    let name = rest_after(line, k + 3)
+    if str.len(name) == 0
+        return Err(FtpBadListLine(line))
+    let kind = unix_kind(str.byte_at_or(w[0], 0, 0))
+    var shown = name
+    var target = ""
+    if kind == "link"
+        let arrow = str.index(name, " -> ") ?? -1
+        if arrow > 0
+            shown = str.slice(name, 0, arrow)
+            target = str.slice(name, arrow + 4, str.len(name))
+    Ok(FtpEntry { name: shown, kind: kind, size: ftpwire.parse_number(w[k - 1]),
+                  modify: w[k] + " " + w[k + 1] + " " + w[k + 2], perm: w[0], target: target, facts: [] })
+
+// Whether `w` is a DOS date, `02-29-24` or `02-29-2024`.
+fn is_dos_date(w: Str) -> Bool
+    let p = str.split(w, "-")
+    list.len(p) == 3 and str.len(p[0]) == 2 and str.len(p[1]) == 2 and (str.len(p[2]) == 2 or str.len(p[2]) == 4)
+        and ftpwire.parse_number(p[0]) >= 0 and ftpwire.parse_number(p[1]) >= 0 and ftpwire.parse_number(p[2]) >= 0
+
+// Whether `w` is a DOS time, `12:30PM` or `12:30`.
+fn is_dos_time(w: Str) -> Bool
+    let n = str.len(w)
+    let clock = str.slice(w, 0, 5)
+    (n == 7 or n == 5) and str.byte_at_or(w, 2, 0) == 58 and ftpwire.parse_number(str.slice(clock, 0, 2)) >= 0
+        and ftpwire.parse_number(str.slice(clock, 3, 5)) >= 0
+        and (n == 5 or str.slice(w, 5, 7) == "AM" or str.slice(w, 5, 7) == "PM")
+
+// Read one line of the Windows IIS format:
+// `02-29-24  12:30PM       <DIR>          name` or
+// `02-29-24  12:30PM             1234 name`.
+//
+// ```novo
+// use ftplist
+//
+// fn main() [io]
+//     match ftplist.parse_dos("02-29-24  12:30PM             1234 my file.txt")
+//         Ok(e)  => println("${e.name} ${e.size}")   // my file.txt 1234
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_dos(line: Str) -> Result<FtpEntry, FtpError>
+    let w = str.words(line)
+    if list.len(w) < 4 or not is_dos_date(w[0]) or not is_dos_time(w[1])
+        or w[2] != "<DIR>" and ftpwire.parse_number(w[2]) < 0
+        return Err(FtpBadListLine(line))
+    let is_dir = w[2] == "<DIR>"
+    Ok(FtpEntry { name: str.trim_start(rest_after(line, 3)), kind: (if is_dir then "dir" else "file"),
+                  size: (if is_dir then -1 else ftpwire.parse_number(w[2])), modify: w[0] + " " + w[1], perm: "",
+                  target: "", facts: [] })
+
+// The lines of a data transfer, without their CRLF or LF.
+fn lines_of(data: [u8]) -> [Str]
+    list.map(str.split(bytes.byte_list_to_str(data), "\n"), l => str.trim_end(l))
+
+// Read the data of a LIST transfer into entries.
+//
+// Each line is read as the Unix format when it begins with a mode
+// character and as the DOS format when it begins with a digit.  A line
+// of the form `total 12` is ignored; an empty line is ignored; any other
+// line that no format reads is counted in `skipped`.
+//
+// ```novo
+// use ftplist
+//
+// fn main() [io]
+//     let data = bytes.to_byte_list(bytes.from_str("total 4\r\n-rw-r--r-- 1 u g 12 Jan 12 10:30 a.txt\r\n"))
+//     let l = ftplist.parse_listing(data)
+//     println("${list.len(l.entries)} ${l.skipped}")   // 1 0
+// ```
+pub fn parse_listing(data: [u8]) -> FtpListing
+    var entries: [FtpEntry] = []
+    var skipped = 0
+    for line in lines_of(data)
+        if str.len(line) == 0 or str.starts_with(line, "total ")
+            continue
+        let first = str.byte_at_or(line, 0, 0)
+        let parsed = if first >= 48 and first <= 57
+            parse_dos(line)
+        else
+            parse_unix(line)
+        match parsed
+            Ok(e)  => list.push(entries, e)
+            Err(_) =>
+                skipped = skipped + 1
+    FtpListing { entries: entries, skipped: skipped }
+
+// Read the data of an MLSD transfer into entries.
+//
+// An empty line is ignored and any line that is not facts and a name is
+// counted in `skipped`.
+//
+// ```novo
+// use ftplist
+//
+// fn main() [io]
+//     let data = bytes.to_byte_list(bytes.from_str("type=dir;modify=20240101000000; sub\r\n"))
+//     let l = ftplist.parse_mlsd(data)
+//     println("${l.entries[0].kind}")   // dir
+// ```
+pub fn parse_mlsd(data: [u8]) -> FtpListing
+    var entries: [FtpEntry] = []
+    var skipped = 0
+    for line in lines_of(data)
+        if str.len(line) == 0
+            continue
+        match parse_facts(line)
+            Ok(e)  => list.push(entries, e)
+            Err(_) =>
+                skipped = skipped + 1
+    FtpListing { entries: entries, skipped: skipped }
